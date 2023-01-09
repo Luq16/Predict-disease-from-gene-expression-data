@@ -1,0 +1,206 @@
+---
+title: <span style="color:#000080; font-size:25px"> Tumor prediction from transcriptomic data  </span>
+author: "Seun Awoniyi"
+date: "`r format(Sys.time(), '%B %d, %Y')`"
+output: 
+  html_document:
+    toc: true 
+    toc_float: TRUE
+    toc_depth: 4  # upto three depths of headings (specified by #, ##, ### and ####)
+    number_sections: true  ## if you want number sections at each table   header
+    theme: united  # theme option.
+    highlight: tango  # specifies the syntax highlighting style
+    fig_caption: true
+    widgets: "nyt_home"
+    hitheme: twitter-bootstrap
+    assets:
+      css:
+        - "http://fonts.googleapis.com/css?family=Raleway:300"
+        - "http://fonts.googleapis.com/css?family=Oxygen"
+---
+<!------------------------------- styling css --------------------------------------->
+<style>
+body{
+  font-family: 'Oxygen', sans-serif;
+  font-size: 16px;
+  line-height: 24px;
+}
+
+
+
+h1,h2,h3,h4 {
+  font-family: 'Raleway', sans-serif;
+  text-align: center;
+}
+
+.container { width: 1000px; }
+h1 {
+  background-color: #D4DAEC;
+  text-indent: 100px;
+  font-size:25px;
+}
+h4 {
+  text-indent: 100px;
+}
+
+</style>
+
+
+<!------------------------------ /styling css --------------------------------------->
+
+# Load packages
+```{r echo=TRUE}
+pacman::p_load(rio, dplyr, kableExtra, knitr, iterativeBMA, randomForest, caTools, caret)
+```
+
+# Information about data
+
+The data set used in this analysis is breast cancer RNAseq dataset download from Firehose (https://gdac.broadinstitute.org/).
+This data has already been normalized.
+
+# Data import and preprocessing
+```{r eval=FALSE, include=FALSE}
+#Download dataset from Firehose
+# url_data <- "http://gdac.broadinstitute.org/runs/stddata__2016_01_28/data/BRCA/20160128/gdac.broadinstitute.org_BRCA.Merge_rnaseqv2__illuminahiseq_rnaseqv2__unc_edu__Level_3__RSEM_genes_normalized__data.Level_3.2016012800.0.0.tar.gz"
+# dest_file <- "~/Desktop/geneXpresionData/data/data.gz"
+# download.file(url_data, dest_file)
+```
+
+
+
+```{r echo=TRUE}
+# Read data
+count_df <- rio::import("data/BRCA.rnaseqv2__illuminahiseq_rnaseqv2__unc_edu__Level_3__RSEM_genes_normalized__data.data.txt")
+head(count_df) %>% 
+  kbl(caption = "Table") %>% 
+  kable_paper(bootstrap_options = "striped", full_width = F) %>% 
+  kable_styling(fixed_thead = T, full_width = FALSE) %>% 
+  scroll_box(width = "800px")
+```
+
+
+```{r echo=TRUE}
+#dataframe dimension
+dim(count_df)
+```
+
+The top 2 rows of data_set contains additional header information that are not needed for further downstream analysis. I will remove these 2 rows.
+```{r echo=TRUE}
+# remove top 2 rows 
+count_df <- count_df %>% 
+  slice(-c(1,2)) #%>% #drop top 2 rows
+
+rownames(count_df) <- count_df$`Hybridization REF` # make gene_id row name
+count_df$`Hybridization REF` <- NULL #remove column "Hybridization REF"
+  
+head(count_df) %>% 
+  kbl(caption = "Table") %>% 
+  kable_paper(bootstrap_options = "striped", full_width = F) %>% 
+  kable_styling(fixed_thead = T, full_width = FALSE) %>% 
+  scroll_box(width = "700px")
+```
+
+
+```{r echo=TRUE}
+dim(count_df)
+```
+
+Convert values in columns to numeric
+```{r echo=TRUE}
+# convert columns to numerics
+count_df <- mutate_all(count_df, function(x) as.numeric(as.character(x)))
+```
+
+The diagnosis is embedded in the column names. For instance in column name: TCGA-3C-AALJ-01A-31R-A41B-07, the sample type is indicated in the 4th group ("01A"). __Tumor samples__ range from 01 - 09 , __normal samples__ from 10 to 19 and __control samples__ from 20 - 29. I want to create a diagnostic class where 0 represent normal samples and 1 for tumor samples. Therefore, I need to extract the sample type from the column name.
+
+```{r echo=TRUE}
+# Patient IDs
+pat_IDs <- count_df %>%
+  colnames()
+
+# Extract sample types from IDs
+samp_class <- lapply(as.list(t(pat_IDs)), function(t) substr(unlist(strsplit(t, "-"))[4], 1, 2))
+diag_class <- as.data.frame(samp_class)
+diag_class <- mutate_all(diag_class, function(x) as.numeric(as.character(x)))
+#diag_class
+```
+
+Count number of class
+```{r echo=TRUE}
+#count number of each type
+table(unlist(diag_class))
+```
+
+
+```{r}
+count_df <- data.frame(t(count_df), diag_class = t(diag_class))
+```
+
+Tumor class = 1 and non-tumor class = 0
+```{r echo=TRUE}
+count_df$diag_class <- ifelse(count_df$diag_class < 10, 1, 0)
+```
+
+Count number of tumor and normal samples
+```{r echo=TRUE}
+#count of tumor samples and normal samples
+table(count_df$diag_class)
+```
+
+```{r echo=TRUE}
+# to free memory remove objects not in used.
+gc()
+```
+
+## Feature Selection Using bss/wss
+Use bss/wss to select important genes.
+```{r echo=TRUE}
+bss <- BssWssFast (count_df[-1], count_df$diag_class, numClass = 2)
+```
+
+Selected top 100 most important features after bss/wss analysis
+```{r echo=TRUE}
+selectedFeatures <- count_df[,bss$ix[1:100]] 
+#selectedFeatures
+#dim(selectedFeatures)
+```
+
+```{r echo=TRUE}
+selectedFeatures <- data.frame(selectedFeatures, diag_class = count_df$diag_class)
+```
+
+# Prediction using top 100 important genes
+```{r echo=TRUE}
+split = sample.split(selectedFeatures$diag_class, SplitRatio = 0.75)
+training_set = subset(selectedFeatures, split == TRUE)
+test_set = subset(selectedFeatures, split == FALSE)
+```
+
+```{r echo=TRUE}
+table(training_set$diag_class)
+```
+It is important to point that there is __class imbalance__ in the training dataset and the the training dataset is skewed into tumor samples (1100 tumor samples and 112 normal samples).
+
+```{r echo=TRUE}
+set.seed(123)
+classifier = randomForest(as.factor(diag_class) ~ .,
+                          data = training_set,
+                          ntree = 500,
+                          mtry = 10)
+
+```
+
+```{r echo=TRUE}
+y_pred = predict(classifier, newdata = test_set)
+```
+
+```{r echo=TRUE}
+cm = confusionMatrix(y_pred, as.factor(test_set$diag_class))
+cm
+```
+
+Based on 95% confidence interval accuracy the accuracy of the above model lies between 95 & to 99%. Despite class imbalance the model still perform good. Although it can still br further improved
+```{r echo=TRUE}
+sessionInfo()
+```
+
